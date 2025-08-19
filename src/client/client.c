@@ -232,8 +232,8 @@ int main(int argc, char **argv) {
             break;
         } else if (res->status == PROCESSING) {
             printf("Job is still processing...\n");
-        } else if (res->status == NOT_STARTED) {
-            printf("Job has not started yet...\n");
+        } else if (res->status == SUBMITTED) {
+            printf("Job has been submitted...\n");
         }
         
         // Small delay to avoid busy waiting

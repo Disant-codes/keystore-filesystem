@@ -12,7 +12,7 @@ job_queue * job_queue_init(void){
 void job_queue_free(job_queue *q){
     if(!q) return;
     pthread_mutex_lock(&q->p_mutex);
-    while (!q->head) {
+    while (q->head) {
         job * j = q->head->next_job;
         job_free(q->head);
         q->head = j;
@@ -46,6 +46,8 @@ void job_push(job_queue *q,job *j){
     q->tail = j;
     pthread_cond_signal(&q->p_cond);
     pthread_mutex_unlock(&q->p_mutex);
+    update_job_status(j,SUBMITTED);
+    notify_job_status(j);
 }
 
 job * job_pop(job_queue *q){
@@ -59,6 +61,8 @@ job * job_pop(job_queue *q){
         if (!q->head) q->tail = NULL;
     }
     pthread_mutex_unlock(&q->p_mutex);
+    update_job_status(j,PROCESSING);
+    notify_job_status(j);
     return j;
 }
 
@@ -92,4 +96,76 @@ job_request * job_request_init(enum job_type type,char *key, char *value){
 void job_request_free(job_request *req){
     free(req);
     req=NULL;
+}
+
+void process_job(job *work_job){
+    int rc = 0;
+    if (!work_job || !work_job->response || !work_job->request) {
+        return;
+    }
+    // Mark as processing
+    update_job_status(work_job,PROCESSING);
+    notify_job_status(work_job);
+
+    // For now, we simply mark the job as completed immediately.
+    switch (work_job->request->type) {
+        case PUT:
+        case DELETE:
+        case GET:
+        default:
+            rc = 0;
+            break;
+    }
+    rc == 0 ? update_job_status(work_job,COMPLETED): update_job_status(work_job,FAILED);
+    notify_job_status(work_job);
+}
+
+void * job_worker_thread(void *arg){
+    job_queue *queue = (job_queue *)arg;
+    for(;;){
+        job *work_job = job_pop(queue);
+        if (!work_job) {
+            continue;
+        }
+        process_job(work_job);
+        job_free(work_job);
+    }
+    return NULL;
+}
+
+int job_worker_pool_init(job_queue *queue, int num_threads){
+    if (!queue) return 0;
+    if (num_threads <= 0) num_threads = JOB_WORKER_THREAD_COUNT;
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+    int started = 0;
+    for (int i = 0; i < num_threads; i++) {
+        pthread_t tid;
+        int rc = pthread_create(&tid, &attr, job_worker_thread, (void *)queue);
+        if (rc == 0) {
+            started++;
+        } else {
+            // Stop attempting further threads on failure
+            break;
+        }
+    }
+
+    pthread_attr_destroy(&attr);
+    return started;
+}
+
+void update_job_status(job *work_job,enum job_status status){
+    if(!work_job) return;
+    work_job->response->status = status;
+}
+
+void notify_job_status(job *work_job){
+    if(!work_job) return;
+    if (send(work_job->client_fd, work_job->response, sizeof(job_response), 0) < 0) {
+        syslog(LOG_ERR, "keystored::failed to send response to client %d", 
+            work_job->response->status);
+    }
 }

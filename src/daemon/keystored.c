@@ -151,33 +151,12 @@ int handle_client_request(client_connection_t *client) {
     }
     
     new_job->next_job = NULL;
-    
+    new_job->client_fd = client->fd;
     // Submit job to queue
     job_push(g_job_queue, new_job);
-    
     syslog(LOG_INFO, "keystored::submitted job (type: %d, key: %s) from client %s:%d to queue", 
            req.type, req.key, client->client_ip, client->port);
     
-    // Send initial response to client
-    job_response response;
-    memset(&response, 0, sizeof(job_response));
-    response.type = req.type;
-    response.status = NOT_STARTED;
-    response.error = NO_ERROR;
-    
-    if (send(client->fd, &response, sizeof(job_response), 0) < 0) {
-        syslog(LOG_ERR, "keystored::failed to send initial response to client %s:%d", 
-               client->client_ip, client->port);
-               return 1;
-    }
-    //dummy sleep 
-    sleep(2);
-    response.status = COMPLETED;
-    if (send(client->fd, &response, sizeof(job_response), 0) < 0) {
-        syslog(LOG_ERR, "keystored::failed to send completed response to client %s:%d", 
-               client->client_ip, client->port);
-               return 1;
-    }
     return 0;
 }
 
@@ -222,25 +201,23 @@ int daemonize(void) {
 
 int main(int argc, char *argv[]){
     int rc;
-    
     const char *bind_ip = "127.0.0.1";
     int port = 5000;
     
     //setup logs
     openlog(DAEMON_NAME, LOG_PID|LOG_CONS, LOG_DAEMON);
     
-    // Initialize job queue
-    g_job_queue = job_queue_init();
-    if (!g_job_queue) {
-        syslog(LOG_ERR, "keystored::failed to initialize job queue");
+    //Daemonize the process
+    rc = daemonize();
+    if (rc < 0) {
+        syslog(LOG_ERR, "keystored::failed to daemonize");
         return 1;
     }
-    
+
     //Create socket
     int listen_socket = create_socket(bind_ip, port);
     if (listen_socket < 0) {
         syslog(LOG_ERR, "keystored::failed to create socket");
-        job_queue_free(g_job_queue);
         return 1;
     }
     
@@ -249,38 +226,43 @@ int main(int argc, char *argv[]){
     if (epoll_fd < 0) {
         syslog(LOG_ERR, "keystored::failed to create epoll");
         close(listen_socket);
-        job_queue_free(g_job_queue);
         return 1;
     }
     
     //Add listen socket to epoll
     add_epoll_fd(epoll_fd, listen_socket, NULL, EPOLLIN);
     
-    //Daemonize the process
-    rc = daemonize();
-    if (rc < 0) {
-        syslog(LOG_ERR, "keystored::failed to daemonize");
-        close(epoll_fd);
+    syslog(LOG_INFO, "keystored::started on %s:%d", bind_ip, port);
+
+    g_job_queue = job_queue_init();
+    if (!g_job_queue) {
+        syslog(LOG_ERR, "keystored::failed to initialize job queue");
         close(listen_socket);
+        close(epoll_fd);
+        return 1;
+    }
+
+    rc = job_worker_pool_init(g_job_queue, NUM_THREADS);
+    if(rc){
+        syslog(LOG_ERR, "keystored::failed to create thead pool");
         job_queue_free(g_job_queue);
+        close(listen_socket);
+        close(epoll_fd);
         return 1;
     }
     
-    syslog(LOG_INFO, "keystored::started on %s:%d", bind_ip, port);
-
-    // Handle termination signals 
+    // Handle signals 
     signal(SIGTERM, handle_signal);
     signal(SIGINT, handle_signal);
 
     // Main event loop
-    struct epoll_event events[25]; // Handle up to 10 events at once
-    int max_events = 25;
+    struct epoll_event events[MAX_EVENT]; 
     
     while (keep_running) {
-        int nfds = epoll_wait(epoll_fd, events, max_events, 250); // 1 second timeout
+        int nfds = epoll_wait(epoll_fd, events, MAX_EVENT, 250); 
         if (nfds < 0) {
             if (errno == EINTR) {
-                continue; // Interrupted by signal
+                continue;
             }
             syslog(LOG_ERR, "keystored::epoll_wait failed");
             break;

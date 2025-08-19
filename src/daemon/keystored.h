@@ -13,7 +13,8 @@
 #include "job_executor.h"
 
 #define DAEMON_NAME "keyvalued"
-
+#define NUM_THREADS     16
+#define MAX_EVENT       16
 // Client connection structure
 typedef struct client_connection {
     int fd;
