@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c99 -pthread -Iinclude
+CFLAGS = -Wall -Wextra -std=c99 -D_POSIX_C_SOURCE=200809L -pthread -Iinclude 
 LDFLAGS = -pthread
 
 # Directories

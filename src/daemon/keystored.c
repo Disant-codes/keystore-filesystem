@@ -2,6 +2,53 @@
 
 static job_queue *g_job_queue = NULL;
 int keep_running = 1;
+storage_state_t g_storage;
+
+// Safe pointer to the start of the superblock memory (block 0)
+static inline uint8_t * sb_block_ptr(storage_state_t *st) { 
+    return st ? (uint8_t*)st->mapped_ptr : NULL; 
+}
+
+// Forward declarations
+static inline uint8_t * block_ptr(storage_state_t *state, uint32_t block_index);
+static int hash_buckets_block_init(storage_state_t *st, uint32_t bucket_count);
+
+// Forward declaration of functions
+// Initialize bucket block on first create
+static int hash_buckets_block_init(storage_state_t *st, uint32_t bucket_count) {
+    if (!st) return -1;
+    // allocate a block to hold buckets
+    uint32_t blk = 0;
+    if (storage_block_alloc(st, &blk) != 0) return -1;
+    uint32_t *arr = (uint32_t*)block_ptr(st, blk);
+    if (!arr) { storage_block_free(st, blk); return -1; }
+    size_t need = (size_t)bucket_count * sizeof(uint32_t);
+    if (need > st->super.block_size) { storage_block_free(st, blk); return -1; }
+    memset(arr, 0, need);
+    msync(arr, need, MS_SYNC);
+    // record in superblock
+    keystore_super_block_t *sb = (keystore_super_block_t*)sb_block_ptr(st);
+    sb->hash_bucket_count = bucket_count;
+    sb->hash_buckets_block = blk;
+    msync(sb, sizeof(*sb), MS_SYNC);
+    st->super.hash_bucket_count = bucket_count;
+    st->super.hash_buckets_block = blk;
+    return 0;
+}
+
+// ---------------- Free-list management ----------------
+//   - Block 0 is the superblock (never on free list)
+//   - For each FREE block i (i >= 1), the first 4 bytes store `next_free_block_index` (uint32_t)
+//   - The superblock stores the head of the free list and the free block count
+
+// Returns a pointer to the beginning of the block within the mmap, or NULL on error.
+static uint8_t * block_ptr(storage_state_t *state, uint32_t block_index){
+    if (!state || !state->mapped_ptr) return NULL;
+    if (block_index >= state->super.num_blocks) return NULL;
+    size_t offset = (size_t)block_index * (size_t)state->super.block_size;
+    if (offset + sizeof(uint32_t) > state->mapped_size) return NULL;
+    return (uint8_t*)state->mapped_ptr + offset;
+}
 
 void handle_signal(int sig) {
     if (sig == SIGTERM || sig == SIGINT) {
@@ -45,6 +92,209 @@ int create_epoll(void) {
         return -1;
     }
     return epollfd;
+}
+
+int storage_open_or_create(const char *path,
+                           uint32_t default_block_size,
+                           uint32_t default_num_blocks,
+                           storage_state_t *out_state) {
+    if (!out_state) return -1;
+    memset(out_state, 0, sizeof(*out_state));
+
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0 && errno == ENOENT) {
+        fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        if (fd < 0) {
+            syslog(LOG_ERR, "keystored::storage create failed: %m");
+            return -1;
+        }
+        // Compute total size and resize
+        uint64_t total_size = (uint64_t)default_block_size * (uint64_t)default_num_blocks;
+        if (ftruncate(fd, (off_t)total_size) != 0) {
+            syslog(LOG_ERR, "keystored::ftruncate failed: %m");
+            close(fd);
+            return -1;
+        }
+
+        // Map and write superblock
+        void *map = mmap(NULL, (size_t)total_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (map == MAP_FAILED) {
+            syslog(LOG_ERR, "keystored::mmap failed: %m");
+            close(fd);
+            return -1;
+        }
+        keystore_super_block_t *sb = (keystore_super_block_t *)map;
+        memset(sb, 0, sizeof(*sb));
+        sb->magic = KEYSTORE_MAGIC;
+        sb->version = KEYSTORE_VERSION;
+        sb->total_size = total_size;
+        sb->block_size = default_block_size;
+        sb->num_blocks = default_num_blocks;
+        sb->free_list_head_block = 0;
+        sb->free_block_count = 0;
+        msync(map, sizeof(*sb), MS_SYNC);
+
+        out_state->fd = fd;
+        out_state->mapped_ptr = map;
+        out_state->mapped_size = (size_t)total_size;
+        out_state->super = *sb;
+        pthread_mutex_init(&out_state->freelist_mutex, NULL);
+        // Format the free list now that the file exists
+        freelist_format(out_state);
+        return 0;
+    } else if (fd < 0) {
+        syslog(LOG_ERR, "keystored::storage open failed: %m");
+        return -1;
+    }
+
+    // Existing file: map and validate superblock
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        syslog(LOG_ERR, "keystored::fstat failed: %m");
+        close(fd);
+        return -1;
+    }
+    void *map = mmap(NULL, (size_t)st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        syslog(LOG_ERR, "keystored::mmap failed: %m");
+        close(fd);
+        return -1;
+    }
+    keystore_super_block_t *sb = (keystore_super_block_t *)map;
+    if (sb->magic != KEYSTORE_MAGIC || sb->version != KEYSTORE_VERSION) {
+        syslog(LOG_ERR, "keystored::invalid superblock (magic=%u version=%u)", sb->magic, sb->version);
+        munmap(map, (size_t)st.st_size);
+        close(fd);
+        return -1;
+    }
+    out_state->fd = fd;
+    out_state->mapped_ptr = map;
+    out_state->mapped_size = (size_t)st.st_size;
+    out_state->super = *sb;
+    pthread_mutex_init(&out_state->freelist_mutex, NULL);
+    return 0;
+}
+
+void storage_close(storage_state_t *state){
+    if (!state) return;
+    if (state->mapped_ptr && state->mapped_size) {
+        msync(state->mapped_ptr, state->mapped_size, MS_SYNC);
+        munmap(state->mapped_ptr, state->mapped_size);
+    }
+    if (state->fd > 0) close(state->fd);
+    pthread_mutex_destroy(&state->freelist_mutex);
+    memset(state, 0, sizeof(*state));
+}
+
+void storage_print_superblock_ascii(const storage_state_t *state){
+    if (!state) return;
+    const keystore_super_block_t *sb = &state->super;
+    printf("+----------------------+------------------------------+\n");
+    printf("| %-20s | %-28s |\n", "Field", "Value");
+    printf("+----------------------+------------------------------+\n");
+    printf("| %-20s | 0x%08X                   |\n", "magic", sb->magic);
+    printf("| %-20s | %10u                    |\n", "version", sb->version);
+    printf("| %-20s | %10llu bytes          |\n", "total_size", (unsigned long long)sb->total_size);
+    printf("| %-20s | %10u bytes/block     |\n", "block_size", sb->block_size);
+    printf("| %-20s | %10u blocks          |\n", "num_blocks", sb->num_blocks);
+    printf("| %-20s | %10u (block index)  |\n", "free_head", sb->free_list_head_block);
+    printf("| %-20s | %10u blocks          |\n", "free_count", sb->free_block_count);
+    printf("+----------------------+------------------------------+\n");
+}
+
+
+
+// Small helpers to read/write the `next` pointer inside a block
+static inline int freelist_read_next(storage_state_t *state, uint32_t block_index, uint32_t *out_next){
+    void *ptr = block_ptr(state, block_index);
+    if (!ptr || !out_next) return -1;
+    memcpy(out_next, ptr, sizeof(uint32_t));
+    return 0;
+}
+
+static inline int freelist_write_next(storage_state_t *state, uint32_t block_index, uint32_t next_index){
+    void *ptr = block_ptr(state, block_index);
+    if (!ptr) return -1;
+    memcpy(ptr, &next_index, sizeof(uint32_t));
+    return 0;
+}
+
+// Formats the free list over data blocks [1 .. num_blocks-1].
+// This is called when creating a brand new storage image.
+int freelist_format(storage_state_t *state){
+    if (!state || !state->mapped_ptr) return -1;
+    const uint32_t first_data = 1;
+    const uint32_t last_data = (state->super.num_blocks == 0) ? 0 : (state->super.num_blocks - 1);
+
+    // Make a simple chain: i -> i+1, last -> 0 (end)
+    for (uint32_t i = first_data; i <= last_data; i++) {
+        uint32_t next = (i < last_data) ? (i + 1) : 0;
+        if (freelist_write_next(state, i, next) != 0) return -1;
+    }
+
+    keystore_super_block_t *live_sb = (keystore_super_block_t*)state->mapped_ptr;
+    if (state->super.num_blocks > 1) {
+        live_sb->free_list_head_block = first_data;
+        live_sb->free_block_count = state->super.num_blocks - 1;
+    } else {
+        live_sb->free_list_head_block = 0;
+        live_sb->free_block_count = 0;
+    }
+    msync(live_sb, sizeof(*live_sb), MS_SYNC);
+    state->super.free_list_head_block = live_sb->free_list_head_block;
+    state->super.free_block_count = live_sb->free_block_count;
+    return 0;
+}
+
+// Pops a block from the free list. Returns 0 on success and writes the block index.
+int storage_block_alloc(storage_state_t *state, uint32_t *out_block_index){
+    if (!state || !out_block_index) return -1;
+    pthread_mutex_lock(&state->freelist_mutex);
+
+    keystore_super_block_t *live_sb = (keystore_super_block_t*)state->mapped_ptr;
+    const uint32_t head = live_sb->free_list_head_block;
+    if (head == 0 || live_sb->free_block_count == 0) {
+        pthread_mutex_unlock(&state->freelist_mutex);
+        return -1; // No free blocks
+    }
+
+    uint32_t next = 0;
+    if (freelist_read_next(state, head, &next) != 0) {
+        pthread_mutex_unlock(&state->freelist_mutex);
+        return -1;
+    }
+
+    live_sb->free_list_head_block = next;
+    live_sb->free_block_count -= 1;
+    msync(live_sb, sizeof(*live_sb), MS_SYNC);
+    state->super.free_list_head_block = live_sb->free_list_head_block;
+    state->super.free_block_count = live_sb->free_block_count;
+    pthread_mutex_unlock(&state->freelist_mutex);
+    *out_block_index = head;
+    return 0;
+}
+
+// Pushes a block back onto the free list (LIFO). Returns 0 on success.
+int storage_block_free(storage_state_t *state, uint32_t block_index){
+    if (!state) return -1;
+    if (block_index == 0 || block_index >= state->super.num_blocks) return -1; 
+
+    pthread_mutex_lock(&state->freelist_mutex);
+    keystore_super_block_t *live_sb = (keystore_super_block_t*)state->mapped_ptr;
+
+    // The freed block points to the current head
+    if (freelist_write_next(state, block_index, live_sb->free_list_head_block) != 0) {
+        pthread_mutex_unlock(&state->freelist_mutex);
+        return -1;
+    }
+    // Update head and count
+    live_sb->free_list_head_block = block_index;
+    live_sb->free_block_count += 1;
+    msync(live_sb, sizeof(*live_sb), MS_SYNC);
+    state->super.free_list_head_block = live_sb->free_list_head_block;
+    state->super.free_block_count = live_sb->free_block_count;
+    pthread_mutex_unlock(&state->freelist_mutex);
+    return 0;
 }
 
 void add_epoll_fd(int epfd, int fd, void *ptr, uint32_t events) {
@@ -199,13 +449,27 @@ int daemonize(void) {
     return 0;
 }
 
-int main(int argc, char *argv[]){
+int main(){
     int rc;
     const char *bind_ip = "127.0.0.1";
     int port = 5000;
     
     //setup logs
     openlog(DAEMON_NAME, LOG_PID|LOG_CONS, LOG_DAEMON);
+
+    // Initialize storage BEFORE daemonizing so errors are visible in foreground
+    rc = storage_open_or_create(KEYSTORE_IMG_PATH, DEFAULT_BLOCK_SIZE, DEFAULT_NUM_BLOCKS, &g_storage);
+    if (rc != 0) {
+        syslog(LOG_ERR, "keystored::storage initialization failed");
+        return 1;
+    }
+    // Initialize hash bucket block on first create; if already set, skip
+    if (g_storage.super.hash_buckets_block == 0){
+        if (hash_buckets_block_init(&g_storage, DEFAULT_HASH_BUCKETS) != 0){
+            syslog(LOG_ERR, "keystored::failed to init hash bucket block");
+            return 1;
+        }
+    }
     
     //Daemonize the process
     rc = daemonize();
@@ -311,6 +575,8 @@ int main(int argc, char *argv[]){
         job_queue_free(g_job_queue);
     }
     
+    // Close storage mapping/file
+    storage_close(&g_storage);
     closelog();
     return 0;
 }
